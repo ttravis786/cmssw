@@ -37,6 +37,7 @@
 #include "DataFormats/HGCalDigi/interface/alpaka/HGCalDigiDevice.h"
 #include "DataFormats/HGCalReco/interface/HGCalSoARecHitsHostCollection.h"
 #include "DataFormats/HGCalReco/interface/alpaka/HGCalSoARecHitsDeviceCollection.h"
+#include "DataFormats/Portable/interface/PortableHostCollection.h"
 
 // includes for size, calibration, and configuration parameters
 #include "CondFormats/DataRecord/interface/HGCalElectronicsMappingRcd.h"
@@ -82,6 +83,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                     hgcaldigi::HGCalDigiDevice const& deviceDigis,
                     HGCalCalibParamDevice const& deviceCalib,
                     HGCalCMCorrectionDeviceCollection& deviceCorrections);
+    void putCMMLDebug(device::Event& iEvent);
 
     edm::ESWatcher<HGCalElectronicsMappingRcd> calibWatcher_;
     const edm::EDGetTokenT<hgcaldigi::HGCalDigiHost> digisToken_;
@@ -119,6 +121,14 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     void printCellAreaComparison(device::EventSetup const& iSetup,
                                  std::vector<std::string> const& typecodes,
                                  uint32_t nmodules) const;
+
+    // produceCMMLDebug: DNN inputs as fed to the model (ndigis x F::Size, row-major), raw model output,
+    // correction and valid per digi; empty when the DNN did not run
+    const bool produceCMMLDebug_;
+    edm::EDPutTokenT<std::vector<float>> cmmlFeaturesToken_, cmmlOutputToken_, cmmlCorrectionToken_;
+    edm::EDPutTokenT<std::vector<unsigned char>> cmmlValidToken_;
+    std::optional<PortableHostCollection<hgcalcmml::HGCalCMMLSoA>> debugFeatures_;
+    std::optional<PortableHostCollection<hgcalcmml::HGCalCMCorrectionSoA>> debugOutput_, debugCorrections_;
   };
 
   namespace {
@@ -190,7 +200,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         useCMML_{iConfig.getParameter<bool>("useCMML")},
         cmAltAsNominal_{iConfig.getParameter<bool>("cmAltAsNominal")},
         cmAlgo_{iConfig.getParameter<int>("cm_n_threads")},
-        compareCellAreas_{iConfig.getParameter<bool>("compareCellAreas")} {
+        compareCellAreas_{iConfig.getParameter<bool>("compareCellAreas")},
+        produceCMMLDebug_{iConfig.getParameter<bool>("produceCMMLDebug")} {
+    if (produceCMMLDebug_) {
+      // produces("label").produces<T>(): the plain produces<T>("label") can't deduce the host product
+      cmmlFeaturesToken_ = produces("cmmlFeatures").produces<std::vector<float>>();
+      cmmlOutputToken_ = produces("cmmlOutput").produces<std::vector<float>>();
+      cmmlCorrectionToken_ = produces("cmmlCorrection").produces<std::vector<float>>();
+      cmmlValidToken_ = produces("cmmlValid").produces<std::vector<unsigned char>>();
+    }
 #ifndef HGCAL_PERF_TEST
     if (n_hits_scale_ > 1) {
       throw cms::Exception("RuntimeError") << "Build with `HGCAL_PERF_TEST` flag to activate `n_hits_scale`.";
@@ -337,6 +355,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     desc.add<int>("cm_n_threads", 256);
     desc.add<bool>("compareCellAreas", false)
         ->setComment("print cellareas.json vs dense index area() for every channel of full wafers, once per job");
+    desc.add<bool>("produceCMMLDebug", false)
+        ->setComment("put the DNN inputs, raw output, correction and valid per digi in the event (debugging)");
     descriptions.addWithDefaultLabel(desc);
   }
 
@@ -549,8 +569,51 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                                           deviceCorrections.view().records().correction());
     model_->forward(queue, inputs, outputs);
 
+    // debug products: inputs and raw output before denormalisation, read in produce() after the queue sync
+    if (produceCMMLDebug_) {
+      debugFeatures_.emplace(queue, ndigis);
+      debugOutput_.emplace(queue, ndigis);
+      alpaka::memcpy(queue, debugFeatures_->buffer(), deviceFeatures.const_buffer());
+      alpaka::memcpy(queue, debugOutput_->buffer(), deviceCorrections.const_buffer());
+    }
+
     if (normalize_)
       cmAlgo_.denormalizeOutputs(queue, ndigis, deviceIndex, d_tgtMean->data(), d_tgtStd->data(), deviceCorrections);
+
+    if (produceCMMLDebug_) {
+      debugCorrections_.emplace(queue, ndigis);
+      alpaka::memcpy(queue, debugCorrections_->buffer(), deviceCorrections.const_buffer());
+    }
+  }
+
+  void HGCalRecHitsProducer::putCMMLDebug(device::Event& iEvent) {
+    std::vector<float> features, output, correction;
+    std::vector<unsigned char> valid;
+    if (debugFeatures_) {
+      const uint32_t ndigis = uint32_t(debugFeatures_->view().metadata().size());
+      auto fv = debugFeatures_->const_view();
+      auto ov = debugOutput_->const_view();
+      auto cv = debugCorrections_->const_view();
+      features.reserve(size_t(ndigis) * F::Size);
+      output.reserve(ndigis);
+      correction.reserve(ndigis);
+      valid.reserve(ndigis);
+      for (uint32_t i = 0; i < ndigis; ++i) {
+        auto const f = fv[i].features();
+        for (uint32_t k = 0; k < F::Size; ++k)
+          features.push_back(f(k));
+        output.push_back(ov[i].correction());
+        correction.push_back(cv[i].correction());
+        valid.push_back(cv[i].valid());
+      }
+    }
+    iEvent.emplace(cmmlFeaturesToken_, std::move(features));
+    iEvent.emplace(cmmlOutputToken_, std::move(output));
+    iEvent.emplace(cmmlCorrectionToken_, std::move(correction));
+    iEvent.emplace(cmmlValidToken_, std::move(valid));
+    debugFeatures_.reset();
+    debugOutput_.reset();
+    debugCorrections_.reset();
   }
 
   void HGCalRecHitsProducer::produce(device::Event& iEvent, device::EventSetup const& iSetup) {
@@ -559,6 +622,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
     LogDebug("HGCalRecHitsProducer") << "\n\nINFO -- storing rec hits in the event";  //<< std::endl;
     iEvent.emplace(recHitsToken_, std::move(recHits));
+    if (produceCMMLDebug_)
+      putCMMLDebug(iEvent);
   }
 
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE
