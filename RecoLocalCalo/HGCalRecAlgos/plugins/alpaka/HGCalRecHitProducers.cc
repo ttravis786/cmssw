@@ -14,6 +14,7 @@
 #include <chrono>
 #include <optional>
 #include <string>
+#include <vector>
 
 // Alpaka imports
 #include "HeterogeneousCore/AlpakaCore/interface/alpaka/stream/SynchronizingFixedQueueEDProducer.h"
@@ -82,12 +83,18 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     const device::ESGetToken<hgcal::HGCalDenseIndexInfoDevice, HGCalDenseIndexInfoRcd> indexingToken_;
     const device::ESGetToken<hgcal::HGCalMappingModuleParamDevice, HGCalElectronicsMappingRcd> moduleToken_;
     const device::EDPutToken<HGCalSoARecHitsDeviceCollection> recHitsToken_;
+    // number of selected rechits in each non-empty layer, in the order of the rechit SoA (for the clustering)
+    const edm::EDPutTokenT<std::vector<uint32_t>> layerSizesToken_;
     const HGCalRecHitCalibrationAlgorithms calibrator_;
     const double k_noise_;
     const int n_hits_scale_;
     int ndigis_;
     host_buffer<int32_t> nsel_;
+    // selected rechits per layer slot (hgcalrechitlayers), and where each slot starts in the rechit SoA
+    host_buffer<uint32_t[]> layerCounts_;
+    host_buffer<uint32_t[]> layerOffsets_;
     std::optional<device_buffer<Device, int32_t[]>> sidx_;
+    std::optional<device_buffer<Device, uint32_t[]>> layerCountsDevice_;
     std::optional<HGCalSoARecHitsDeviceCollection> recHits_;
 
     // CM DNN
@@ -108,10 +115,18 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         indexingToken_{esConsumes(iConfig.getParameter<edm::ESInputTag>("indexingSource"))},
         moduleToken_{esConsumes()},
         recHitsToken_{produces()},
-        calibrator_{iConfig.getParameter<int>("n_blocks"), iConfig.getParameter<int>("n_threads")},
+        layerSizesToken_{produces("layerSizes")},
+        calibrator_{iConfig.getParameter<int>("n_blocks"),
+                    iConfig.getParameter<int>("n_threads"),
+                    {float(iConfig.getParameter<double>("timeResolutionNoiseTerm")),
+                     float(iConfig.getParameter<double>("timeResolutionConstTerm")),
+                     float(iConfig.getParameter<double>("timeResolutionMinSoN")),
+                     float(iConfig.getParameter<double>("timeResolutionMaxSoN"))}},
         k_noise_{iConfig.getParameter<double>("k_noise")},
         n_hits_scale_{iConfig.getParameter<int>("n_hits_scale")},
         nsel_{make_host_buffer<int32_t, Platform>()},
+        layerCounts_{make_host_buffer<uint32_t[], Platform>(hgcalrechitlayers::kLayerSlots + 1)},
+        layerOffsets_{make_host_buffer<uint32_t[], Platform>(hgcalrechitlayers::kLayerSlots)},
         useCMML_{iConfig.getParameter<bool>("useCMML")},
         cmAltAsNominal_{iConfig.getParameter<bool>("cmAltAsNominal")},
         cmAlgo_{iConfig.getParameter<int>("cm_n_threads")} {
@@ -120,6 +135,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       throw cms::Exception("RuntimeError") << "Build with `HGCAL_PERF_TEST` flag to activate `n_hits_scale`.";
     }
 #endif
+    if (!(iConfig.getParameter<double>("timeResolutionMinSoN") > 0. &&
+          iConfig.getParameter<double>("timeResolutionMaxSoN") >= iConfig.getParameter<double>("timeResolutionMinSoN")))
+      throw cms::Exception("Configuration") << "timeResolutionMinSoN must be > 0 and <= timeResolutionMaxSoN";
     if (cmAltAsNominal_ && !useCMML_)
       throw cms::Exception("Configuration") << "cmAltAsNominal=True requires useCMML=True";
     if (!useCMML_)
@@ -141,6 +159,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     desc.add<int>("n_blocks", -1);
     desc.add<int>("n_threads", -1);
     desc.add<int>("n_hits_scale", -1);
+    // rechit time resolution sqrt((a / (S/N))^2 + c^2): placeholders, the Phase-2 values of HGCalRecHit_cfi.py
+    desc.add<double>("timeResolutionNoiseTerm", 5.5)->setComment("a, in ns");
+    desc.add<double>("timeResolutionConstTerm", 0.02)->setComment("c, in ns");
+    desc.add<double>("timeResolutionMinSoN", 10.)->setComment("S/N below this is set to it");
+    desc.add<double>("timeResolutionMaxSoN", 1.e4)->setComment("above this S/N the resolution is c");
     desc.add<bool>("useCMML", false)->setComment("Run the CM DNN for energy_variations(CM_ALT), else CM_ALT = energy");
     desc.add<bool>("cmAltAsNominal", false)
         ->setComment("use the DNN CM for energy (ZS, clustering), the linear CM for energy_variations(CM_ALT)");
@@ -237,9 +260,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     LogDebug("HGCalRecHitsProducer") << "\n\nINFO -- calling calibrate method";  //<< std::endl;
     *nsel_ = 0;
     sidx_ = make_device_buffer<int32_t[]>(queue, ndigis_);
+    layerCountsDevice_ = make_device_buffer<uint32_t[]>(queue, hgcalrechitlayers::kLayerSlots + 1);
+    alpaka::memset(queue, *layerCountsDevice_, 0x0);
     recHits_ = calibrator_.calibrate(queue,
                                      nsel_.data(),
                                      sidx_->data(),
+                                     layerCountsDevice_->data(),
                                      deviceDigis,
                                      deviceCalibParam,
                                      deviceModuleInfoProvider,
@@ -248,6 +274,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                      deviceCorrections,
                                      cmAltAsNominal_,
                                      k_noise_);
+    alpaka::memcpy(queue, layerCounts_, *layerCountsDevice_);
 #endif
 
 #ifdef EDM_ML_DEBUG
@@ -291,11 +318,37 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   }
 
   void HGCalRecHitsProducer::produce(device::Event& iEvent, device::EventSetup const& iSetup) {
-    auto recHits = calibrator_.select(iEvent.queue(), ndigis_, nsel_.data(), sidx_->data(), *recHits_);
+    using namespace hgcalrechitlayers;
+    auto& queue = iEvent.queue();
+
+    // Step 2 of the grouping by layer (see hgcalrechitlayers in HGCalRecHitCalibrationAlgorithms.h): acquire() counted
+    // the selected rechits per layer slot. Layer slot s starts in the output where the slots before it end, so its
+    // offset is the sum of the counts of slots 0..s-1.
+    uint32_t const* counts = layerCounts_.data();
+    if (counts[kLayerSlots] > 0)
+      throw cms::Exception("LogicError") << counts[kLayerSlots] << " selected rechits have a layer outside [0, "
+                                         << kMaxLayersPerSide << ")";
+    std::vector<uint32_t> layerSizes;  // the counts of the non-empty slots, in output order, for the clustering
+    uint32_t nextStart = 0;
+    for (uint32_t s = 0; s < kLayerSlots; ++s) {
+      layerOffsets_.data()[s] = nextStart;
+      nextStart += counts[s];
+      if (counts[s] > 0)
+        layerSizes.push_back(counts[s]);
+    }
+    if (nextStart != static_cast<uint32_t>(*nsel_))
+      throw cms::Exception("LogicError") << nextStart << " rechits counted per layer, " << *nsel_ << " selected";
+    auto layerOffsetsDevice = make_device_buffer<uint32_t[]>(queue, kLayerSlots);
+    alpaka::memcpy(queue, layerOffsetsDevice, layerOffsets_);
+
+    auto recHits =
+        calibrator_.select(queue, ndigis_, nsel_.data(), sidx_->data(), layerOffsetsDevice.data(), *recHits_);
     sidx_.reset();
+    layerCountsDevice_.reset();
 
     LogDebug("HGCalRecHitsProducer") << "\n\nINFO -- storing rec hits in the event";  //<< std::endl;
     iEvent.emplace(recHitsToken_, std::move(recHits));
+    iEvent.emplace(layerSizesToken_, std::move(layerSizes));
   }
 
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE

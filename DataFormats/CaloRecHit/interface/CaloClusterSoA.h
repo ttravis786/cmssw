@@ -10,6 +10,8 @@
 #include "DataFormats/DetId/interface/DetId.h"
 #include <xtd/xtd.h>
 
+#include <Eigen/Core>
+
 namespace reco {
 
   GENERATE_SOA_LAYOUT(CaloClusterSoAPosition,
@@ -32,12 +34,23 @@ namespace reco {
 
   GENERATE_SOA_LAYOUT(CaloClusterSoATiming, SOA_COLUMN(float, time), SOA_COLUMN(float, timeError))
 
+  // Alternative values of the energy and time of a cluster, one entry per variation, e.g. from a different
+  // calibration. The meaning of each index is set by the detector (HGCAL: hgcalreco::Variation); an undefined
+  // variation equals nominal. A producer that does not compute variations gives this block size 0.
+  using CaloClusterVariationVector = Eigen::Matrix<float, 2, 1>;
+
+  GENERATE_SOA_LAYOUT(CaloClusterSoAVariations,
+                      SOA_EIGEN_COLUMN(CaloClusterVariationVector, energyVariations),
+                      SOA_EIGEN_COLUMN(CaloClusterVariationVector, timeVariations),
+                      SOA_EIGEN_COLUMN(CaloClusterVariationVector, timeErrorVariations))
+
   // clang-format off
   GENERATE_SOA_BLOCKS(CaloClusterSoALayout,
                       SOA_BLOCK(position, CaloClusterSoAPosition),
                       SOA_BLOCK(energy, CaloClusterSoAEnergy),
                       SOA_BLOCK(indexes, CaloClusterSoAIndexes),
                       SOA_BLOCK(timing, CaloClusterSoATiming),
+                      SOA_BLOCK(variations, CaloClusterSoAVariations),
                       SOA_CONST_VIEW_METHODS(
                         SOA_HOST_DEVICE auto r(std::integral auto idx) const {
                           const auto x = this->position()[idx].x();

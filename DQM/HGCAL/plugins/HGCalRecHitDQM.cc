@@ -283,11 +283,11 @@ void HGCalRecHitDQM::bookHistograms(DQMStore::IBooker& ibook, edm::Run const& ru
       std::string label("Layer " + std::to_string(layer));
 
       recHitSummariesLayers_[endcap][layer]["rechittime"] =
-          ibook.book1D("rechittime", label + ";RecHit time [ps]; RecHits", 100, 0, 5000);
+          ibook.book1D("rechittime", label + ";RecHit time [ns]; RecHits", 100, 0, 5);
       recHitSummariesLayers_[endcap][layer]["rechitenergy"] =
           ibook.book1D("rechitenergy", label + ";RecHit energy [MIPs]; RecHits", 100, 0, 250);
       recHitSummariesLayers_[endcap][layer]["rechittimevsenergy"] =
-          ibook.book2D("rechittimevsenergy", label + ";Energy [MIP]; RecHit time [ps]", 100, -10, 1000, 100, 0, 5000);
+          ibook.book2D("rechittimevsenergy", label + ";Energy [MIP]; RecHit time [ns]", 100, -10, 1000, 100, 0, 5);
     }
   }
 }

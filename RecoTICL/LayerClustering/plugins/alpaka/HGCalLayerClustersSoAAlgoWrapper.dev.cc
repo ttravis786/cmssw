@@ -2,6 +2,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 
 #include <alpaka/alpaka.hpp>
 
@@ -9,6 +10,8 @@
 #include "HeterogeneousCore/AlpakaInterface/interface/memory.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/prefixScan.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/workdivision.h"
+
+#include "DataFormats/HGCalReco/interface/HGCalRecoVariations.h"
 
 #include "HGCalLayerClustersSoAAlgoWrapper.h"
 #include "ConstantsForClusters.h"
@@ -19,6 +22,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   using namespace hgcal::constants;
 
   namespace {
+
+    // the variations of the layer clusters are the ones of the rechits
+    constexpr uint32_t kNVariations = ::reco::CaloClusterVariationVector::RowsAtCompileTime;
+    static_assert(kNVariations == hgcalreco::Variation::Size);
 
     // Scintillator (BH) rechits store (eta, phi) in (dim1, dim2). Recover the
     // cartesian transverse position from them and the cell z.
@@ -130,7 +137,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
 
     // Per rechit -> per layer cluster: the sum of the energies, the number of cells, the DetId of the seed, the key of
-    // the most energetic rechit and the number of rechits with a time
+    // the most energetic rechit and the number of rechits with a time. If energyVariations is set, also the sum of the
+    // energies of each variation k, at energyVariations[k * nLayerClusters + c].
     struct KernelLayerClusterEnergy {
       ALPAKA_FN_ACC void operator()(const Acc1D& acc,
                                     bool isScintillator,
@@ -138,13 +146,20 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                     HGCalSoARecHitsExtraDeviceCollection::ConstView recHitsClustering,
                                     reco::CaloClusterDeviceCollection::View layerClusters,
                                     uint64_t* maxEnergyKey,
-                                    uint32_t* timedHits) const {
+                                    uint32_t* timedHits,
+                                    float* energyVariations) const {
+        const uint32_t nLayerClusters = layerClusters.position().metadata().size();
         for (auto i : uniform_elements(acc, recHits.metadata().size())) {
           const int c = recHitsClustering[i].clusterIndex();
           if (c == kInvalidCluster) {
             continue;
           }
           alpaka::atomicAdd(acc, &layerClusters.energy()[c].energy(), recHits[i].energy());
+          if (energyVariations != nullptr) {
+            for (uint32_t k = 0; k < kNVariations; ++k) {
+              alpaka::atomicAdd(acc, &energyVariations[k * nLayerClusters + c], recHits[i].energy_variations()(k));
+            }
+          }
           alpaka::atomicAdd(acc, &layerClusters.position()[c].cells(), 1);
           alpaka::atomicMax(acc, &maxEnergyKey[c], energyKey(recHits[i].energy(), i));
           if (recHitsClustering[i].isSeed() == 1) {
@@ -161,7 +176,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     // The scintillator rechits are weighted by their energy, the silicon rechits within 1.3 cm (1+6 cells, for all
     // thicknesses) of the most energetic one by max(thresholdW0 + log(energy / cluster energy), 0).
     // Also copies the time and the time weight (1 / timeError^2) of each rechit with a time to the segment of its layer
-    // cluster in times and weights, which starts at timedOffsets[c].
+    // cluster in times and weights, which starts at timedOffsets[c]. If timesVariations is set, the same for each
+    // variation k, at the same slot plus k * nRecHits in timesVariations and weightsVariations (the rechits with a time
+    // are the same for all variations).
     struct KernelLayerClusterPositionSums {
       ALPAKA_FN_ACC void operator()(const Acc1D& acc,
                                     float thresholdW0,
@@ -175,8 +192,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                     const uint32_t* timedOffsets,
                                     uint32_t* timedFilled,
                                     float* times,
-                                    float* weights) const {
-        for (auto i : uniform_elements(acc, recHits.metadata().size())) {
+                                    float* weights,
+                                    float* timesVariations,
+                                    float* weightsVariations) const {
+        const uint32_t nRecHits = recHits.metadata().size();
+        for (auto i : uniform_elements(acc, nRecHits)) {
           const int c = recHitsClustering[i].clusterIndex();
           if (c == kInvalidCluster) {
             continue;
@@ -188,6 +208,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
             const uint32_t slot = timedOffsets[c] + alpaka::atomicAdd(acc, &timedFilled[c], 1u);
             times[slot] = recHits[i].time();
             weights[slot] = 1.f / (timeError * timeError);
+            if (timesVariations != nullptr) {
+              for (uint32_t k = 0; k < kNVariations; ++k) {
+                const float timeErrorK = recHits[i].timeError_variations()(k);
+                timesVariations[k * nRecHits + slot] = recHits[i].time_variations()(k);
+                weightsVariations[k * nRecHits + slot] = 1.f / (timeErrorK * timeErrorK);
+              }
+            }
           }
 
           if (isScintillator) {
@@ -218,7 +245,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
     // Per layer cluster: the transverse position from the weighted sums, or the one of its most energetic rechit if
     // no rechit has a weight, z and the layer of its most energetic rechit, and the time from the times of its rechits.
-    // Also sets the columns not computed yet to the defaults of reco::CaloCluster.
+    // Also sets the columns not computed yet to the defaults of reco::CaloCluster. If energyVariations is set, fills
+    // the variations block: the energies summed per variation, and the time of each variation from its own times and
+    // weights.
     struct KernelLayerClusterPositionAndTime {
       ALPAKA_FN_ACC void operator()(const Acc1D& acc,
                                     bool isScintillator,
@@ -229,8 +258,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                     const uint64_t* maxEnergyKey,
                                     const uint32_t* timedOffsets,
                                     float* times,
-                                    float* weights) const {
-        for (auto c : uniform_elements(acc, layerClusters.position().metadata().size())) {
+                                    float* weights,
+                                    const float* energyVariations,
+                                    float* timesVariations,
+                                    float* weightsVariations) const {
+        const uint32_t nLayerClusters = layerClusters.position().metadata().size();
+        const uint32_t nRecHits = recHits.metadata().size();
+        for (auto c : uniform_elements(acc, nLayerClusters)) {
           const uint32_t maxHit = hitOfEnergyKey(maxEnergyKey[c]);
           auto position = layerClusters.position()[c];
           if (positionWeightSum[c] > 0.f) {
@@ -256,6 +290,19 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           layerClusters.timing()[c].time() = time.time;
           layerClusters.timing()[c].timeError() = time.error;
 
+          if (energyVariations != nullptr) {
+            auto variations = layerClusters.variations()[c];
+            for (uint32_t k = 0; k < kNVariations; ++k) {
+              variations.energyVariations()(k) = energyVariations[k * nLayerClusters + c];
+              const LayerClusterTime timeK = fixSizeHighestDensity(timesVariations + k * nRecHits + first,
+                                                                   weightsVariations + k * nRecHits + first,
+                                                                   timedOffsets[c + 1] - first,
+                                                                   nHitsTime);
+              variations.timeVariations()(k) = timeK.time;
+              variations.timeErrorVariations()(k) = timeK.error;
+            }
+          }
+
           layerClusters.energy()[c].correctedEnergy() = -1.f;
           layerClusters.energy()[c].correctedEnergyUncertainty() = -1.f;
           layerClusters.indexes()[c].algoID() = ::reco::CaloCluster::undefined;
@@ -272,6 +319,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                                              float positionDeltaRho2,
                                              bool isScintillator,
                                              uint32_t nHitsTime,
+                                             bool computeVariations,
                                              HGCalSoARecHitsDeviceCollection::ConstView recHits,
                                              HGCalSoARecHitsExtraDeviceCollection::ConstView recHitsClustering,
                                              reco::CaloClusterDeviceCollection::View layerClusters) const {
@@ -309,6 +357,20 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     alpaka::memset(queue, timedFilled, 0x0);
     auto times = make_device_buffer<float[]>(queue, nRecHits);
     auto weights = make_device_buffer<float[]>(queue, nRecHits);
+    // with variations: the energy of each variation k of layer cluster c at k * nLayerClusters + c, and the times and
+    // time weights of each variation in the same segments as times and weights, shifted by k * nRecHits
+    std::optional<device_buffer<Device, float[]>> energyVariations;
+    std::optional<device_buffer<Device, float[]>> timesVariations;
+    std::optional<device_buffer<Device, float[]>> weightsVariations;
+    if (computeVariations) {
+      energyVariations = make_device_buffer<float[]>(queue, kNVariations * nLayerClusters);
+      alpaka::memset(queue, *energyVariations, 0x0);
+      timesVariations = make_device_buffer<float[]>(queue, kNVariations * nRecHits);
+      weightsVariations = make_device_buffer<float[]>(queue, kNVariations * nRecHits);
+    }
+    float* const energyVariationsPtr = computeVariations ? energyVariations->data() : nullptr;
+    float* const timesVariationsPtr = computeVariations ? timesVariations->data() : nullptr;
+    float* const weightsVariationsPtr = computeVariations ? weightsVariations->data() : nullptr;
 
     constexpr uint32_t blockSize = 64;
     const auto workDivRecHits = make_workdiv<Acc1D>(divide_up_by(nRecHits, blockSize), blockSize);
@@ -321,7 +383,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         recHitsClustering,
                         layerClusters,
                         maxEnergyKey.data(),
-                        timedHits.data());
+                        timedHits.data(),
+                        energyVariationsPtr);
     // inclusive scan of the counts, so timedOffsets[c + 1] is where the segment of layer cluster c ends
     iterativePrefixScan<Acc1D>(queue, timedHits.data(), timedOffsets.data() + 1, nLayerClusters);
     alpaka::exec<Acc1D>(queue,
@@ -338,7 +401,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         timedOffsets.data(),
                         timedFilled.data(),
                         times.data(),
-                        weights.data());
+                        weights.data(),
+                        timesVariationsPtr,
+                        weightsVariationsPtr);
     alpaka::exec<Acc1D>(queue,
                         workDivLayerClusters,
                         KernelLayerClusterPositionAndTime{},
@@ -350,7 +415,10 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         maxEnergyKey.data(),
                         timedOffsets.data(),
                         times.data(),
-                        weights.data());
+                        weights.data(),
+                        energyVariationsPtr,
+                        timesVariationsPtr,
+                        weightsVariationsPtr);
   }
 
 }  // namespace ALPAKA_ACCELERATOR_NAMESPACE

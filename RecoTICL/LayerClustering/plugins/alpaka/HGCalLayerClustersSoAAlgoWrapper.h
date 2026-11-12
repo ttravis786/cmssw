@@ -14,13 +14,15 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
   public:
     // Fills the nLayerClusters layer clusters (energy, number of cells, seed, position and time) from the rechits and
     // their clustering (the layer cluster and the seed flag of each rechit). A layer cluster needs at least nHitsTime
-    // rechits with a time to get a time.
+    // rechits with a time to get a time. With computeVariations, also fills the variations block (of size
+    // nLayerClusters) from the energy and time variations of the rechits, with the same rechits in each layer cluster.
     void run(Queue& queue,
              uint32_t nLayerClusters,
              float thresholdW0,
              float positionDeltaRho2,
              bool isScintillator,
              uint32_t nHitsTime,
+             bool computeVariations,
              HGCalSoARecHitsDeviceCollection::ConstView recHits,
              HGCalSoARecHitsExtraDeviceCollection::ConstView recHitsClustering,
              reco::CaloClusterDeviceCollection::View layerClusters) const;

@@ -19,8 +19,12 @@ GENERATE_SOA_LAYOUT(HGCalSoARecHitsLayout,
                     SOA_COLUMN(unsigned int, recHitIndex),
                     SOA_COLUMN(uint16_t, flags),
                     SOA_COLUMN(uint32_t, detid),
-                    SOA_COLUMN(float, time),
-                    SOA_COLUMN(float, timeError))
+                    SOA_COLUMN(float, time),       // ns, -99 if none
+                    SOA_COLUMN(float, timeError),  // ns, -1 if no time
+                    // by hgcalreco::Variation: time and time error with the energy of the variation (same rechits
+                    // with a time as the nominal one)
+                    SOA_EIGEN_COLUMN(hgcalreco::VariationVector, time_variations),
+                    SOA_EIGEN_COLUMN(hgcalreco::VariationVector, timeError_variations))
 
 using HGCalSoARecHits = HGCalSoARecHitsLayout<>;
 

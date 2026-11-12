@@ -29,7 +29,8 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           thresholdW0_(config.getParameter<float>("thresholdW0")),
           positionDeltaRho2_(config.getParameter<float>("positionDeltaRho2")),
           isScintillator_(config.getParameter<std::string>("detector") == "BH"),
-          nHitsTime_(config.getParameter<unsigned int>("nHitsTime")) {}
+          nHitsTime_(config.getParameter<unsigned int>("nHitsTime")),
+          computeVariations_(config.getParameter<bool>("computeVariations")) {}
 
     // The number of layer clusters is on the device, and the host needs it to allocate them
     void acquire(const device::Event& iEvent, const device::EventSetup&) override {
@@ -41,14 +42,20 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
 
     void produce(device::Event& iEvent, const device::EventSetup&) override {
-      reco::CaloClusterDeviceCollection layerClusters(
-          iEvent.queue(), nLayerClusters_, nLayerClusters_, nLayerClusters_, nLayerClusters_);
+      // the variations block is empty unless the variations are computed
+      reco::CaloClusterDeviceCollection layerClusters(iEvent.queue(),
+                                                      nLayerClusters_,
+                                                      nLayerClusters_,
+                                                      nLayerClusters_,
+                                                      nLayerClusters_,
+                                                      computeVariations_ ? nLayerClusters_ : 0u);
       algo_.run(iEvent.queue(),
                 nLayerClusters_,
                 thresholdW0_,
                 positionDeltaRho2_,
                 isScintillator_,
                 nHitsTime_,
+                computeVariations_,
                 iEvent.get(recHitsToken_).view(),
                 iEvent.get(recHitsClusteringToken_).view(),
                 layerClusters.view());
@@ -65,6 +72,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
           ->setComment("HGCAL component; 'BH' computes the scintillator centroid in cartesian (eta,phi->x,y).");
       desc.add<unsigned int>("nHitsTime", 3)
           ->setComment("Minimum number of rechits with a time for a layer cluster to get a time.");
+      desc.add<bool>("computeVariations", false)
+          ->setComment(
+              "Fill the variations block from the energy and time variations of the rechits; else it has size 0.");
       descriptions.addWithDefaultLabel(desc);
     }
 
@@ -76,6 +86,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     const float positionDeltaRho2_;
     const bool isScintillator_;
     const unsigned int nHitsTime_;
+    const bool computeVariations_;
     const HGCalLayerClustersSoAAlgoWrapper algo_{};
     // copied from the device in acquire, used in produce
     unsigned int nLayerClusters_ = 0;

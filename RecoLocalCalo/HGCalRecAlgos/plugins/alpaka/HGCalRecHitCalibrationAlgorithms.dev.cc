@@ -5,6 +5,7 @@
 
 // Alpaka imports
 //#include <alpaka/alpaka.hpp>
+#include "HeterogeneousCore/AlpakaInterface/interface/memory.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/traits.h"
 #include "HeterogeneousCore/AlpakaInterface/interface/workdivision.h"
 
@@ -103,8 +104,12 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  // @short apply INL and timewalk corrections, and convert TOA to time (ps)
+  // @short apply INL and timewalk corrections, and convert TOA to time (ns), shifted by 12.5 ns when there is a timewalk
+  // calibration. A rechit has a time if it is available, its TOA was read out and fired (toa > 0) and it has a noise;
+  // the others get time -99 and timeError -1. The time error follows from the S/N of the rechit.
   struct HGCalRecHitCalibrationKernel_toaToTime {
+    HGCalRecHitTimeResolution timeResolution;
+
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   HGCalSoARecHitsDeviceCollection::View recHits,
                                   HGCalDigiDevice::ConstView digis,
@@ -119,9 +124,18 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         return (ftdc_corr + 8 * ctdc_corr + 256 * gray) % 1024;
       };
 
-      auto toa_tw_corr = [&](uint32_t toa, float energy, hgcalrechit::Vector3f p) {
-        return toa - ((energy > p[2]) ? (p[0] + p[1] / (energy - p[2])) : 0.f);
+      // Time walk: TOA_TW = (c, m, p2) of the fit toa = c + m / (ADC - p2) in HGCalTWAnalysis.py (hgcal-comm), with ADC
+      // the linearised ADC counts of the rechit. In TDC counts, kept as a float: the correction is not a whole number of
+      // counts and can be larger than the TOA
+      auto toa_tw_corr = [&](float toa, float adc, hgcalrechit::Vector3f p) {
+        return toa - ((adc > p[2]) ? (p[0] + p[1] / (adc - p[2])) : 0.f);
       };
+
+      // TOAtops is in ps per TDC count; the rechit time is in ns, like the time resolution and the layer clusters
+      constexpr float kTOAtons = hgcalrechit::TOAtops * 1e-3f;
+      // the time walk subtracts c, the TOA at infinite ADC, so the times sit around 0; shift them by half a bunch
+      // crossing so that they lie within the 25 ns TOA window again. Not applied without a timewalk calibration (c = 0)
+      constexpr float kTimeOffset = 12.5f;  // ns
 
       for (auto idx : uniform_elements(acc, digis.metadata().size())) {
         auto calib = calibs[idx];
@@ -131,37 +145,53 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         bool isAvailable((digiflags != ::hgcal::DIGI_FLAG::Invalid) &&
                          (digiflags != ::hgcal::DIGI_FLAG::NotAvailable) && calibvalid);
         bool isToAavailable((digiflags != ::hgcal::DIGI_FLAG::ZS_ToA) &&
-                            (digiflags != ::hgcal::DIGI_FLAG::ZS_ToA_ADCm1) && (digi.toa() != 0));
-        bool isGood(isAvailable && isToAavailable);
+                            (digiflags != ::hgcal::DIGI_FLAG::ZS_ToA_ADCm1));
+        auto recHit = recHits[idx];
+        // with full readout the TOA is always sent, and is 0 if it did not fire
+        if (!(isAvailable && isToAavailable && digi.toa() > 0 && recHit.sigmaNoise() > 0.f)) {
+          recHit.time() = HGCalRecHitTimeResolution::kNoTime;
+          recHit.timeError() = HGCalRecHitTimeResolution::kNoTimeError;
+          for (uint8_t k = 0; k < hgcalreco::Variation::Size; ++k) {
+            recHit.time_variations()(k) = HGCalRecHitTimeResolution::kNoTime;
+            recHit.timeError_variations()(k) = HGCalRecHitTimeResolution::kNoTimeError;
+          }
+          continue;
+        }
         // INL correction
-        float toa = isGood * toa_inl_corr(digi.toa(), calib.TOA_CTDC(), calib.TOA_FTDC());
-        // timewalk correction
-        toa = isGood * toa_tw_corr(toa, recHits[idx].mipEnergy() / calib.MIPS_scale(), calib.TOA_TW());
-        // toa to ps
-        recHits[idx].time() = toa * hgcalrechit::TOAtops;
-        recHits[idx].timeError() = 0.;
+        float const toa = toa_inl_corr(digi.toa(), calib.TOA_CTDC(), calib.TOA_FTDC());
+        // ADC counts of the nominal energy and of each variation, for the timewalk correction
+        float const gevPerADC = calib.EM_scale() * calib.MIPS_scale();
+        float const adc = calib.MIPS_scale() > 0.f ? recHit.mipEnergy() / calib.MIPS_scale() : 0.f;
+        float const offset = calib.TOA_TW()[0] != 0.f ? kTimeOffset : 0.f;
+        // timewalk correction, TOA to ns, offset; the variations redo it with their ADC counts
+        recHit.time() = toa_tw_corr(toa, adc, calib.TOA_TW()) * kTOAtons + offset;
+        recHit.timeError() = timeResolution(recHit.energy(), recHit.sigmaNoise());
+        for (uint8_t k = 0; k < hgcalreco::Variation::Size; ++k) {
+          float const energy = recHit.energy_variations()(k);
+          float const adcK = gevPerADC > 0.f ? energy / gevPerADC : 0.f;
+          recHit.time_variations()(k) = toa_tw_corr(toa, adcK, calib.TOA_TW()) * kTOAtons + offset;
+          recHit.timeError_variations()(k) = timeResolution(energy, recHit.sigmaNoise());
+        }
       }
     }
   };
 
   // @short sum the energy of the RecHits in the calibration and surrounding cells
   // see https://github.com/cms-sw/cmssw/pull/47829
+  // The time is the average of the times of the two cells, weighted by their energies before the merge (a cell without
+  // a time or with a negative energy has weight 0); without weight there is no time. The time error follows from the
+  // merged energy and noise.
   struct HGCalRecHitCalibrationKernel_handleCalibCell {
+    HGCalRecHitTimeResolution timeResolution;
+
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   HGCalSoARecHitsDeviceCollection::View recHits,
                                   HGCalDigiDevice::ConstView digis,
                                   HGCalCalibParamDevice::ConstView calibs,
                                   HGCalMappingCellParamDevice::ConstView cell_maps,
                                   HGCalDenseIndexInfoDevice::ConstView index) const {
-      auto time_average = [&](float time_surr, float time_calib, float energy_surr, float energy_calib) {
-        bool is_time_surr(time_surr > 0);
-        bool is_time_calib(time_calib > 0);
-        float totalEn = (is_time_surr * energy_surr + is_time_calib * energy_calib);
-        float weighted_average =
-            (totalEn > 0)
-                ? (is_time_surr * energy_surr * time_surr + is_time_calib * energy_calib * time_calib) / totalEn
-                : 0.0f;
-        return weighted_average;
+      auto time_weight = [](float timeError, float energy) {
+        return (timeError >= 0.f && energy > 0.f) ? energy : 0.f;
       };
 
       for (auto idx : uniform_elements(acc, digis.metadata().size())) {
@@ -178,8 +208,6 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         auto digiflags = digi.flags();
         bool isAvailable((digiflags != ::hgcal::DIGI_FLAG::Invalid) &&
                          (digiflags != ::hgcal::DIGI_FLAG::NotAvailable) && calibvalid);
-        bool isToAavailable((digiflags != ::hgcal::DIGI_FLAG::ZS_ToA) &&
-                            (digiflags != ::hgcal::DIGI_FLAG::ZS_ToA_ADCm1));
 
         bool isCalibCell(cell_maps[cellIndex].iscalib());
         int offset = cell_maps[cellIndex].caliboffset();  // calibration-to-surrounding cell offset
@@ -192,10 +220,26 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
 
         recHits[idx + offset].flags() = HGCalRecHitFlags::kNormal;
 
-        recHits[idx + offset].time() = isToAavailable * time_average(recHits[idx + offset].time(),
-                                                                     recHits[idx].time(),
-                                                                     recHits[idx + offset].energy(),
-                                                                     recHits[idx].energy());
+        // time weights of the surrounding (idx + offset) and calibration (idx) cells, from the energies before the merge
+        float const w_surr = time_weight(recHits[idx + offset].timeError(), recHits[idx + offset].energy());
+        float const w_calib = time_weight(recHits[idx].timeError(), recHits[idx].energy());
+        bool const hasTime = (w_surr + w_calib) > 0.f;
+        float const time =
+            hasTime ? (w_surr * recHits[idx + offset].time() + w_calib * recHits[idx].time()) / (w_surr + w_calib)
+                    : HGCalRecHitTimeResolution::kNoTime;
+        // the same with the energies of each variation; a variation has a time if the nominal one has, and takes the
+        // nominal time if its energies give no weight
+        for (uint8_t k = 0; k < hgcalreco::Variation::Size; ++k) {
+          float const wk_surr = time_weight(recHits[idx + offset].timeError_variations()(k),
+                                            recHits[idx + offset].energy_variations()(k));
+          float const wk_calib =
+              time_weight(recHits[idx].timeError_variations()(k), recHits[idx].energy_variations()(k));
+          recHits[idx + offset].time_variations()(k) = (hasTime && (wk_surr + wk_calib) > 0.f)
+                                                           ? (wk_surr * recHits[idx + offset].time_variations()(k) +
+                                                              wk_calib * recHits[idx].time_variations()(k)) /
+                                                                 (wk_surr + wk_calib)
+                                                           : time;
+        }
 
         bool is_negative_surr_energy(recHits[idx + offset].energy() < 0);
         auto negative_energy_correction = (-1.0 * recHits[idx + offset].energy()) * is_negative_surr_energy;
@@ -212,6 +256,16 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         float quadratic_noise_sum = sqrt(recHits[idx].sigmaNoise() * recHits[idx].sigmaNoise() +
                                          recHits[idx + offset].sigmaNoise() * recHits[idx + offset].sigmaNoise());
         recHits[idx + offset].sigmaNoise() = quadratic_noise_sum;
+
+        recHits[idx + offset].time() = time;
+        recHits[idx + offset].timeError() = hasTime
+                                                ? timeResolution(recHits[idx + offset].energy(), quadratic_noise_sum)
+                                                : HGCalRecHitTimeResolution::kNoTimeError;
+        for (uint8_t k = 0; k < hgcalreco::Variation::Size; ++k) {
+          recHits[idx + offset].timeError_variations()(k) =
+              hasTime ? timeResolution(recHits[idx + offset].energy_variations()(k), quadratic_noise_sum)
+                      : HGCalRecHitTimeResolution::kNoTimeError;
+        }
       }
     }
   };
@@ -265,33 +319,51 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     }
   };
 
-  //
-  struct HGCalRecHitCalibrationKernel_countRecHits {
+  // Step 1 of the grouping by layer (see hgcalrechitlayers in the header).
+  // Selects the rechits that are kept: sidx[0..nsel-1] gets their indices, in no particular order, and
+  // layerCounts[slot] the number kept in each layer slot.
+  struct HGCalRecHitCalibrationKernel_selectRecHits {
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   int32_t* __restrict__ nsel,
                                   int32_t* __restrict__ sidx,
+                                  uint32_t* __restrict__ layerCounts,
                                   HGCalSoARecHitsDeviceCollection::ConstView recHits,
                                   HGCalMappingCellParamDevice::ConstView cell_maps,
                                   HGCalDenseIndexInfoDevice::ConstView index,
                                   double k_noise = 0.) const {
       for (auto idx : uniform_elements(acc, recHits.metadata().size())) {
-        //quality + ZS cuts + connected (non-calib) channel
-        auto cellIndex = index[idx].cellInfoIdx();
-        if (!recHits[idx].flags() && recHits[idx].energy() > k_noise * recHits[idx].sigmaNoise() &&
-            cell_maps[cellIndex].t() > 0)
-          sidx[alpaka::atomicAdd(acc, nsel, 1)] = idx;
+        auto const& recHit = recHits[idx];
+        bool const goodQuality = !recHit.flags();
+        bool const aboveNoise = recHit.energy() > k_noise * recHit.sigmaNoise();  // zero suppression
+        bool const connectedCell = cell_maps[index[idx].cellInfoIdx()].t() > 0;   // not a calibration cell
+        if (!(goodQuality && aboveNoise && connectedCell))
+          continue;
+
+        // atomicAdd returns the value before the increment, so every kept rechit gets its own place in sidx
+        int32_t const place = alpaka::atomicAdd(acc, nsel, 1);
+        sidx[place] = idx;
+        uint32_t const slot = hgcalrechitlayers::slot(recHit.layer(), recHit.dim3());
+        alpaka::atomicAdd(acc, &layerCounts[slot], 1u);
       }
     }
   };
 
-  //
-  struct HGCalRecHitCalibrationKernel_copyRecHits {
+  // Step 3 of the grouping by layer: copies the selected rechits so that the ones of layer slot s fill
+  // output[layerOffsets[s] .. layerOffsets[s] + layerCounts[s] - 1].
+  // nWrittenInSlot[s] (zeroed by the caller) counts the rechits of slot s already written.
+  struct HGCalRecHitCalibrationKernel_copyRecHitsByLayer {
     ALPAKA_FN_ACC void operator()(Acc1D const& acc,
                                   HGCalSoARecHitsDeviceCollection::View output,
                                   HGCalSoARecHitsDeviceCollection::ConstView recHits,
-                                  int32_t const* __restrict__ sidx) const {
-      for (auto idx : uniform_elements(acc, output.metadata().size()))
-        output[idx] = recHits[sidx[idx]];
+                                  int32_t const* __restrict__ sidx,
+                                  uint32_t const* __restrict__ layerOffsets,
+                                  uint32_t* __restrict__ nWrittenInSlot) const {
+      for (auto isel : uniform_elements(acc, output.metadata().size())) {
+        auto const& recHit = recHits[sidx[isel]];
+        uint32_t const slot = hgcalrechitlayers::slot(recHit.layer(), recHit.dim3());
+        uint32_t const positionInLayer = alpaka::atomicAdd(acc, &nWrittenInSlot[slot], 1u);
+        output[layerOffsets[slot] + positionInLayer] = recHit;
+      }
     }
   };
 
@@ -300,6 +372,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       Queue& queue,
       int32_t* __restrict__ nsel,
       int32_t* __restrict__ sidx,
+      uint32_t* __restrict__ layerCounts,
       HGCalDigiDevice const& device_digis,
       HGCalCalibParamDevice const& device_calib,
       HGCalMappingModuleParamDevice const& device_mapmod,
@@ -340,13 +413,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         device_corrections.const_view());
     alpaka::exec<Acc1D>(queue,
                         grid,
-                        HGCalRecHitCalibrationKernel_toaToTime{},
+                        HGCalRecHitCalibrationKernel_toaToTime{timeResolution_},
                         device_recHits.view(),
                         device_digis.const_view(),
                         device_calib.const_view());
     alpaka::exec<Acc1D>(queue,
                         grid,
-                        HGCalRecHitCalibrationKernel_handleCalibCell{},
+                        HGCalRecHitCalibrationKernel_handleCalibCell{timeResolution_},
                         device_recHits.view(),
                         device_digis.const_view(),
                         device_calib.const_view(),
@@ -359,12 +432,13 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
                         device_mapmod.const_view(),
                         device_index.const_view());
 
-    // select rec hits
+    // select rechits and count them per layer slot (step 1 of the grouping by layer)
     alpaka::exec<Acc1D>(queue,
                         grid,
-                        HGCalRecHitCalibrationKernel_countRecHits{},
+                        HGCalRecHitCalibrationKernel_selectRecHits{},
                         nsel,
                         sidx,
+                        layerCounts,
                         device_recHits.const_view(),
                         device_cell_mapping.const_view(),
                         device_index.const_view(),
@@ -379,6 +453,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
       int const ndigis,
       int32_t const* __restrict__ nsel,
       int32_t const* __restrict__ sidx,
+      uint32_t const* __restrict__ layerOffsets,
       HGCalSoARecHitsDeviceCollection const& device_recHits) const {
     // number of items per group
     uint32_t items = n_threads_;
@@ -390,12 +465,17 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
     auto grid = make_workdiv<Acc1D>(groups, items);
 
     HGCalSoARecHitsDeviceCollection device_selRecHits(queue, *nsel);
+    // the number of rechits already written in each layer slot
+    auto nWrittenInSlot = make_device_buffer<uint32_t[]>(queue, hgcalrechitlayers::kLayerSlots);
+    alpaka::memset(queue, nWrittenInSlot, 0x0);
     alpaka::exec<Acc1D>(queue,
                         grid,
-                        HGCalRecHitCalibrationKernel_copyRecHits{},
+                        HGCalRecHitCalibrationKernel_copyRecHitsByLayer{},
                         device_selRecHits.view(),
                         device_recHits.const_view(),
-                        sidx);
+                        sidx,
+                        layerOffsets,
+                        nWrittenInSlot.data());
 
     LogDebug("HGCalRecHitCalibrationAlgorithms") << "Input recHits: " << std::endl;
 #ifdef EDM_ML_DEBUG

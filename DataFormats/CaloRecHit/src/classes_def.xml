@@ -38,6 +38,7 @@
   <class name="reco::CaloClusterSoAEnergy<128, false>"/>
   <class name="reco::CaloClusterSoAIndexes<128, false>"/>
   <class name="reco::CaloClusterSoATiming<128, false>"/>
+  <class name="reco::CaloClusterSoAVariations<128, false>"/>
 
   <class name="edm::Wrapper<reco::CaloClusterHostCollection>" splitLevel="0"/>
 

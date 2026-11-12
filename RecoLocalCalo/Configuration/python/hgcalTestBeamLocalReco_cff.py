@@ -42,6 +42,32 @@ def setupConditionsForSep2024TB(process):
     return process
 
 
+def addLayerClustersForTB(process, computeVariations : bool):
+    """Layer clusters of the TB rechits (hgcalSoARecHits): CLUEstering on each layer, then their energy, position and
+    time. Returns the three modules."""
+
+    from RecoTICL.LayerClustering.hgCalCLUEsteringLayerClustersProducer_cfi import hgCalCLUEsteringLayerClustersProducer
+    process.hgcalSoARecHitsLayerClusters = hgCalCLUEsteringLayerClustersProducer.clone(
+        hgcalRecHitsSoA="hgcalSoARecHits"
+    )
+
+    from RecoTICL.LayerClustering.hgCalSoALayerClustersProducer_cfi import hgCalSoALayerClustersProducer
+    process.hgcalSoALayerClusters = hgCalSoALayerClustersProducer.clone(
+        hgcalRecHitsLayerClustersSoA="hgcalSoARecHitsLayerClusters",
+        hgcalRecHitsSoA="hgcalSoARecHits",
+        computeVariations=computeVariations
+    )
+
+    from RecoTICL.LayerClustering.hgCalLayerClustersFromSoAProducer_cfi import hgCalLayerClustersFromSoAProducer
+    process.hgcalMergeLayerClusters = hgCalLayerClustersFromSoAProducer.clone(
+        hgcalRecHitsLayerClustersSoA="hgcalSoARecHitsLayerClusters",
+        hgcalRecHitsSoA="hgcalSoARecHits",
+        src="hgcalSoALayerClusters"
+    )
+
+    return [process.hgcalSoARecHitsLayerClusters, process.hgcalSoALayerClusters, process.hgcalMergeLayerClusters]
+
+
 def runRecoForSep2024TB(process):
 
     local_daq = setupLocalInputsForRelVal()
@@ -102,31 +128,9 @@ def runRecoForSep2024TB(process):
                                              k_noise=cms.double(5.)
                                              )
 
-    from RecoTICL.LayerClustering.hgCalSoARecHitsLayerClustersProducer_cfi import hgCalSoARecHitsLayerClustersProducer
-    process.hgcalSoARecHitsLayerClusters = hgCalSoARecHitsLayerClustersProducer.clone(
-        hgcalRecHitsSoA="hgcalSoARecHits"
-    )
-
-    from RecoTICL.LayerClustering.hgCalSoALayerClustersProducer_cfi import hgCalSoALayerClustersProducer
-    process.hgcalSoALayerClusters = hgCalSoALayerClustersProducer.clone(
-        hgcalRecHitsLayerClustersSoA="hgcalSoARecHitsLayerClusters",
-        hgcalRecHitsSoA="hgcalSoARecHits"
-    )
-
-    from RecoTICL.LayerClustering.hgCalLayerClustersFromSoAProducer_cfi import hgCalLayerClustersFromSoAProducer
-    process.hgcalMergeLayerClusters = hgCalLayerClustersFromSoAProducer.clone(
-        hgcalRecHitsLayerClustersSoA="hgcalSoARecHitsLayerClusters",
-        hgcalRecHitsSoA="hgcalSoARecHits",
-        src="hgcalSoALayerClusters"
-    )
-
-    process.reco_task = cms.Task(
-        process.hgcalDigis,
-        process.hgcalSoARecHits,
-        process.hgcalSoARecHitsLayerClusters,
-        process.hgcalSoALayerClusters,
-        process.hgcalMergeLayerClusters
-    )
+    process.reco_task = cms.Task(process.hgcalDigis,
+                                 process.hgcalSoARecHits,
+                                 *addLayerClustersForTB(process, computeVariations=False))
     process.hgcalTestBeamLocalRecoSequence = cms.Path(process.reco_task)
     process.schedule.insert(0, process.hgcalTestBeamLocalRecoSequence)
 
@@ -235,26 +239,8 @@ def runRecoForTB(process, year : int, withLC : bool):
     process.reco_task = cms.Task(process.hgcalSoARecHits)
 
     if withLC:
-        from RecoTICL.LayerClustering.hgCalSoARecHitsLayerClustersProducer_cfi import hgCalSoARecHitsLayerClustersProducer
-        process.hgcalSoARecHitsLayerClusters = hgCalSoARecHitsLayerClustersProducer.clone(
-            hgcalRecHitsSoA="hgcalSoARecHits"
-        )
-
-        from RecoTICL.LayerClustering.hgCalSoALayerClustersProducer_cfi import hgCalSoALayerClustersProducer
-        process.hgcalSoALayerClusters = hgCalSoALayerClustersProducer.clone(
-            hgcalRecHitsLayerClustersSoA="hgcalSoARecHitsLayerClusters",
-            hgcalRecHitsSoA="hgcalSoARecHits"
-        )
-
-        from RecoTICL.LayerClustering.hgCalLayerClustersFromSoAProducer_cfi import hgCalLayerClustersFromSoAProducer
-        process.hgcalMergeLayerClusters = hgCalLayerClustersFromSoAProducer.clone(
-            hgcalRecHitsLayerClustersSoA="hgcalSoARecHitsLayerClusters",
-            hgcalRecHitsSoA="hgcalSoARecHits",
-            src="hgcalSoALayerClusters"
-        )
-        process.reco_task.add(process.hgcalSoARecHitsLayerClusters,
-                              process.hgcalSoALayerClusters,
-                              process.hgcalMergeLayerClusters)
+        # the layer clusters also carry the CM_ALT energy and time
+        process.reco_task.add(*addLayerClustersForTB(process, computeVariations=True))
 
     process.hgcalTestBeamLocalRecoSequence = cms.Path(process.reco_task)
     process.schedule.insert(0, process.hgcalTestBeamLocalRecoSequence)

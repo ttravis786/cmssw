@@ -127,6 +127,11 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE {
         entryInSoA.detid() = detid.rawId();
         entryInSoA.time() = hgrh.time();
         entryInSoA.timeError() = hgrh.timeError();
+        // the legacy rechits have no variations (no CM correction to vary): they equal nominal
+        for (uint8_t k = 0; k < hgcalreco::Variation::Size; ++k) {
+          entryInSoA.time_variations()(k) = hgrh.time();
+          entryInSoA.timeError_variations()(k) = hgrh.timeError();
+        }
       }
 #if 0
         std::cout << "Size: " << cells->metadata().size() << " count cells: " << index
